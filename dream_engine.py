@@ -87,7 +87,8 @@ class ExperimentResult:
             "blocked"        : 0.05,
             "danger"         : -1.0,
         }.get(self.outcome_type, 0.1)
-        return base * self.confidence
+        bonus = getattr(self, "distance_bonus", 0.0)
+        return (base * self.confidence) + bonus
 
     def __repr__(self):
         return (
@@ -123,6 +124,28 @@ class VirtualEnvironment:
         self.cols        = len(grid[0]) if grid else 0
         self._terminated = False
 
+        # Goal-awareness: first goal-like target in grid scan.
+        self.goal_pos: tuple[int, int] | None = None
+        self.goal_priority = {3: 1.0, 4: 0.6, 5: 0.5}
+        self.goal_value = 0.0
+        for r in range(self.rows):
+            for c in range(self.cols):
+                cell = self.grid[r][c]
+                if cell in self.goal_priority:
+                    self.goal_pos = (r, c)
+                    self.goal_value = self.goal_priority[cell]
+                    break
+            if self.goal_pos:
+                break
+
+        if self.goal_pos:
+            self.start_dist = (
+                abs(agent_state.row - self.goal_pos[0]) +
+                abs(agent_state.col - self.goal_pos[1])
+            )
+        else:
+            self.start_dist = 0
+
     # ── movement helpers ──────────────────────
     def _next_position(self, action: str) -> tuple[int, int]:
         """Compute next (row, col) for a given action."""
@@ -145,6 +168,17 @@ class VirtualEnvironment:
             return 2  # treat out-of-bounds as wall
         return self.grid[row][col]
 
+    def _finalize_result(self, result: ExperimentResult) -> ExperimentResult:
+        # Goal-aware bonus: reward moving closer, penalize moving away.
+        distance_bonus = 0.0
+        if self.goal_pos and result.outcome_type not in ("blocked", "danger"):
+            nr = result.predicted_state.row
+            nc = result.predicted_state.col
+            new_dist = abs(nr - self.goal_pos[0]) + abs(nc - self.goal_pos[1])
+            distance_bonus = (self.start_dist - new_dist) * 0.15 * self.goal_value
+        result.distance_bonus = distance_bonus
+        return result
+
     # ── core simulation step ──────────────────
     def step(self, action: str) -> ExperimentResult:
         """
@@ -153,14 +187,14 @@ class VirtualEnvironment:
         Returns an ExperimentResult — never modifies the real world.
         """
         if action == "nothing":
-            return ExperimentResult(
+            return self._finalize_result(ExperimentResult(
                 action="nothing",
                 predicted_state=self.agent.clone(),
                 outcome_type="no_change",
                 confidence=1.0,
                 reasoning="Agent chose to stay. No interaction.",
                 involved_ids=[],
-            )
+            ))
 
         next_row, next_col = self._next_position(action)
         entity_id          = self._entity_at(next_row, next_col)
@@ -168,7 +202,7 @@ class VirtualEnvironment:
 
         # ── unknown entity ────────────────────
         if abstraction is None:
-            return ExperimentResult(
+            return self._finalize_result(ExperimentResult(
                 action=action,
                 predicted_state=self.agent.clone(),
                 outcome_type="blocked",
@@ -178,7 +212,7 @@ class VirtualEnvironment:
                     f"is unknown or quarantined. Treating as obstacle."
                 ),
                 involved_ids=[entity_id],
-            )
+            ))
 
         confidence    = abstraction.confidence
         involved_ids  = [entity_id]
@@ -186,7 +220,7 @@ class VirtualEnvironment:
 
         # ── DANGER — fatal entity ─────────────
         if abstraction.is_dangerous:
-            return ExperimentResult(
+            return self._finalize_result(ExperimentResult(
                 action=action,
                 predicted_state=self.agent.clone(),  # stays — episode ends
                 outcome_type="danger",
@@ -197,7 +231,7 @@ class VirtualEnvironment:
                     f"Moving here terminates the episode. AVOID."
                 ),
                 involved_ids=involved_ids,
-            )
+            ))
 
         # ── BLOCKED — non-passable entity ─────
         if not abstraction.is_passable:
@@ -206,7 +240,7 @@ class VirtualEnvironment:
                 new_agent.row = next_row
                 new_agent.col = next_col
                 new_agent.inventory.remove("key")
-                return ExperimentResult(
+                return self._finalize_result(ExperimentResult(
                     action=action,
                     predicted_state=new_agent,
                     outcome_type="moved",
@@ -217,8 +251,8 @@ class VirtualEnvironment:
                         f"Agent moves through."
                     ),
                     involved_ids=[entity_id, 5],
-                )
-            return ExperimentResult(
+                ))
+            return self._finalize_result(ExperimentResult(
                 action=action,
                 predicted_state=self.agent.clone(),
                 outcome_type="blocked",
@@ -228,7 +262,7 @@ class VirtualEnvironment:
                     f"is not passable. Movement blocked."
                 ),
                 involved_ids=involved_ids,
-            )
+            ))
 
         # ── COLLECTABLE item ──────────────────
         new_agent.row = next_row
@@ -237,7 +271,7 @@ class VirtualEnvironment:
         if abstraction.is_collectable:
             new_agent.inventory.append(abstraction.name)
             outcome = "goal_reached" if abstraction.is_goal else "item_collected"
-            return ExperimentResult(
+            return self._finalize_result(ExperimentResult(
                 action=action,
                 predicted_state=new_agent,
                 outcome_type=outcome,
@@ -248,10 +282,10 @@ class VirtualEnvironment:
                     f"{'PRIMARY GOAL REACHED.' if abstraction.is_goal else ''}"
                 ),
                 involved_ids=involved_ids,
-            )
+            ))
 
         # ── SIMPLE MOVE ───────────────────────
-        return ExperimentResult(
+        return self._finalize_result(ExperimentResult(
             action=action,
             predicted_state=new_agent,
             outcome_type="moved",
@@ -261,7 +295,7 @@ class VirtualEnvironment:
                 f"is passable. Agent moves freely."
             ),
             involved_ids=involved_ids,
-        )
+        ))
 
 
 # ─────────────────────────────────────────────

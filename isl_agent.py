@@ -163,6 +163,7 @@ class ISLAgent:
         step_records: list[StepRecord] = []
         errors: list[float] = []
         patterns_before = self.memory.size()
+        self.memory._repeat_count = {}
 
         grid, agent_state = env.reset()
         done = False

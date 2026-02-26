@@ -111,16 +111,46 @@ class ProceduralPattern:
 # ─────────────────────────────────────────────
 def hash_state(grid: list[list[int]], agent: AgentState) -> str:
     """
-    Produce a short deterministic hash for (grid, agent_position).
-    Two identical states always produce the same hash.
-    Used as the key for ProceduralMemory lookup.
+    Produce a short deterministic hash for local state around the agent.
+    Uses:
+      - agent position
+      - 3x3 local window
+      - sorted inventory
+    This avoids overfitting to static full-grid layouts.
     """
-    flat   = [cell for row in grid for cell in row]
-    digest = hashlib.md5(
-        json.dumps([flat, agent.row, agent.col,
-                    sorted(agent.inventory)]).encode()
-    ).hexdigest()[:12]
-    return digest
+    import hashlib, json
+
+    r, c = agent.row, agent.col
+    rows = len(grid)
+    cols = len(grid[0]) if rows else 0
+
+    window: list[int] = []
+    for dr in range(-1, 2):
+        for dc in range(-1, 2):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                window.append(grid[nr][nc])
+            else:
+                window.append(-1)
+
+    counts: dict[int, int] = {}
+    for row in grid:
+        for cell in row:
+            eid = int(cell)
+            counts[eid] = counts.get(eid, 0) + 1
+
+    key = json.dumps(
+        {
+            "r": r,
+            "c": c,
+            "w": window,
+            "inv": sorted(agent.inventory),
+            # lightweight global signal (not full layout) keeps hash robust
+            "counts": sorted(counts.items()),
+        },
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
 
 
 # ─────────────────────────────────────────────
@@ -141,6 +171,7 @@ class ProceduralMemory:
 
     def __init__(self):
         self._patterns: dict[str, ProceduralPattern] = {}
+        self._repeat_count: dict[str, int] = {}
 
     # ── Core Operations ───────────────────────
     def store(
@@ -214,6 +245,10 @@ class ProceduralMemory:
         positive_outcomes = {"goal_reached", "item_collected", "moved"}
         for p in patterns:
             if p.outcome_type in positive_outcomes and p.confidence >= 0.70:
+                key = f"{hash_state(grid, agent_state)}:{p.action}"
+                self._repeat_count[key] = self._repeat_count.get(key, 0) + 1
+                if self._repeat_count[key] > 3:
+                    return None
                 return p
         return None
 
