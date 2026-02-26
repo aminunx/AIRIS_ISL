@@ -1,0 +1,24 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test/cache artifacts
+.pytest_cache/
+CACHEDIR.tag
+nodeids
+stepwise/
+
+# Local outputs
+benchmark_results.json
+comparison_results.csv
+isl_real_comparison.json
+
+# AIRIS runtime artifacts
+AIRIS_Public/__pycache__/
+AIRIS_Public/screens/
+AIRIS_Public/plan_log/
+AIRIS_Public/predict_log/
+AIRIS_Public/
+stepwise
+gitignore
