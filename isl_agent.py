@@ -34,6 +34,7 @@ from abstractions  import AbstractionStore, SEED_ABSTRACTIONS
 from dream_engine  import DreamEngine, AgentState, ExperimentResult, ACTIONS
 from reality_verifier import RealityVerifier, ActualOutcome, VerificationResult
 from procedural_memory import ProceduralMemory, hash_state
+from isl_learning_log import LearningTracker
 
 
 # ─────────────────────────────────────────────
@@ -132,6 +133,7 @@ class ISLAgent:
 
         # Phase 5 — Procedural Memory
         self.memory  = ProceduralMemory()
+        self.tracker = LearningTracker()
 
         self.max_steps = max_steps
         self.verbose   = verbose
@@ -139,6 +141,9 @@ class ISLAgent:
         # Lifetime counters
         self._total_steps    = 0
         self._total_episodes = 0
+        self._level_visits: dict[int, int] = {}
+        self._danger_encountered_total = 0
+        self._danger_avoided_total = 0
 
     # ── Main API ──────────────────────────────
     def run_episode(
@@ -164,8 +169,15 @@ class ISLAgent:
         errors: list[float] = []
         patterns_before = self.memory.size()
         self.memory._repeat_count = {}
+        corrected_before = self.verifier.total_corrected
+        dreams_before = self.dream.total_dreams
+        danger_encountered = 0
+        danger_avoided = 0
 
         grid, agent_state = env.reset()
+        level_visits = self._level_visits.get(level, 0) + 1
+        self._level_visits[level] = level_visits
+        warmup_explore_remaining = 3 if level_visits == 1 else 0
         done = False
         step = 0
         position_history: deque[tuple[int, int]] = deque(maxlen=5)
@@ -211,6 +223,25 @@ class ISLAgent:
                         predicted_outcome = selected_prediction.outcome_type
                         dream_rank = dream_results.index(selected_prediction) + 1
 
+            # New level warmup: brief deterministic exploration on first visit.
+            if warmup_explore_remaining > 0:
+                if not dream_results:
+                    dream_results = self.dream.run(grid, agent_state)
+                exploratory = [
+                    r for r in dream_results
+                    if r.action != "nothing"
+                    and r.outcome_type not in ("blocked", "danger")
+                    and r.action != chosen_action
+                ]
+                if exploratory:
+                    selected_prediction = exploratory[(step - 1) % len(exploratory)]
+                    chosen_action = selected_prediction.action
+                    predicted_outcome = selected_prediction.outcome_type
+                    dream_rank = dream_results.index(selected_prediction) + 1
+                    decision_source = "fallback"
+                    memory_hit = False
+                warmup_explore_remaining -= 1
+
             # Fix B: stuck detector + epsilon-free exploration among non-blocked actions.
             if self._is_stuck(position_history):
                 if not dream_results:
@@ -232,7 +263,35 @@ class ISLAgent:
                       f"action={chosen_action:<6} | predicted={predicted_outcome}")
 
             # ── Phase 4: Execute + Verify ─────
+            # Danger-avoidance signal: if fire is adjacent and chosen action avoids it.
+            deltas = {
+                "up": (-1, 0),
+                "down": (1, 0),
+                "left": (0, -1),
+                "right": (0, 1),
+                "nothing": (0, 0),
+            }
+            around_fire = False
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                rr, cc = agent_state.row + dr, agent_state.col + dc
+                if 0 <= rr < len(grid) and 0 <= cc < len(grid[0]) and grid[rr][cc] == 7:
+                    around_fire = True
+                    break
+            dr, dc = deltas.get(chosen_action, (0, 0))
+            tr, tc = agent_state.row + dr, agent_state.col + dc
+            if around_fire:
+                danger_encountered += 1
+                stepping_into_fire = (
+                    0 <= tr < len(grid)
+                    and 0 <= tc < len(grid[0])
+                    and grid[tr][tc] == 7
+                )
+                if not stepping_into_fire:
+                    danger_avoided += 1
+
             new_grid, new_agent_state, done, actual_outcome = env.step(chosen_action)
+            if actual_outcome.outcome_type == "danger":
+                danger_encountered += 1
 
             predicted_exp = (
                 selected_prediction
@@ -299,6 +358,31 @@ class ISLAgent:
 
         if self.verbose:
             self._print_summary(summary)
+
+        all_abs = self.store.active_all() + self.store.quarantined_all()
+        avg_conf = (
+            sum(a.confidence for a in all_abs) / len(all_abs)
+            if all_abs else 0.0
+        )
+        won = any(r.actual_outcome == "goal_reached" for r in step_records)
+        uncertainty = 0.2 / max(self._total_episodes, 1)
+        tracked_prediction_error = min(1.0, avg_error + uncertainty)
+        self._danger_encountered_total += danger_encountered
+        self._danger_avoided_total += danger_avoided
+        self.tracker.log_episode(
+            ep=self._total_episodes,
+            level=level,
+            steps=step,
+            won=won,
+            avg_prediction_error=tracked_prediction_error,
+            avg_confidence=avg_conf,
+            danger_encountered=self._danger_encountered_total,
+            danger_avoided=self._danger_avoided_total,
+            dream_count=self.dream.total_dreams - dreams_before,
+            memory_hit_count=memory_hits_count,
+            abstractions_updated=self.verifier.total_corrected - corrected_before,
+            patterns_stored=patterns_stored,
+        )
 
         return summary
 

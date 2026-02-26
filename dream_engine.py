@@ -83,7 +83,7 @@ class ExperimentResult:
             "goal_reached"   : 1.0,
             "item_collected" : 0.7,
             "moved"          : 0.3,
-            "no_change"      : 0.1,
+            "no_change"      : -0.5,
             "blocked"        : 0.05,
             "danger"         : -1.0,
         }.get(self.outcome_type, 0.1)
@@ -123,26 +123,15 @@ class VirtualEnvironment:
         self.rows        = len(grid)
         self.cols        = len(grid[0]) if grid else 0
         self._terminated = False
+        self._has_key    = "key" in self.agent.inventory
 
-        # Goal-awareness: first goal-like target in grid scan.
-        self.goal_pos: tuple[int, int] | None = None
+        # Goal-awareness: dynamic target selection based on reachability.
         self.goal_priority = {3: 1.0, 4: 0.6, 5: 0.5}
-        self.goal_value = 0.0
-        for r in range(self.rows):
-            for c in range(self.cols):
-                cell = self.grid[r][c]
-                if cell in self.goal_priority:
-                    self.goal_pos = (r, c)
-                    self.goal_value = self.goal_priority[cell]
-                    break
-            if self.goal_pos:
-                break
+        self.goal_pos, self.goal_value = self._select_goal(agent_state)
 
+        self.bfs_dist = self._compute_bfs_dist()
         if self.goal_pos:
-            self.start_dist = (
-                abs(agent_state.row - self.goal_pos[0]) +
-                abs(agent_state.col - self.goal_pos[1])
-            )
+            self.start_dist = self.bfs_dist.get((agent_state.row, agent_state.col), 9999)
         else:
             self.start_dist = 0
 
@@ -168,14 +157,114 @@ class VirtualEnvironment:
             return 2  # treat out-of-bounds as wall
         return self.grid[row][col]
 
+    def _is_traversable_for_plan(self, row: int, col: int) -> bool:
+        cell = self.grid[row][col]
+        if cell == 2:
+            return False
+        if cell == 7:
+            return False
+        if cell == 4 and not self._has_key:
+            return False
+        return True
+
+    def _compute_reachable_from_agent(self, agent_state: AgentState) -> dict[tuple[int, int], int]:
+        from collections import deque
+
+        dist: dict[tuple[int, int], int] = {}
+        start = (agent_state.row, agent_state.col)
+        q = deque([(start[0], start[1], 0)])
+        visited = {start}
+
+        while q:
+            r, c, d = q.popleft()
+            dist[(r, c)] = d
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if (
+                    0 <= nr < self.rows
+                    and 0 <= nc < self.cols
+                    and (nr, nc) not in visited
+                    and self._is_traversable_for_plan(nr, nc)
+                ):
+                    visited.add((nr, nc))
+                    q.append((nr, nc, d + 1))
+        return dist
+
+    def _select_goal(self, agent_state: AgentState) -> tuple[tuple[int, int] | None, float]:
+        positions: dict[int, list[tuple[int, int]]] = {3: [], 4: [], 5: []}
+        for r in range(self.rows):
+            for c in range(self.cols):
+                cell = self.grid[r][c]
+                if cell in positions:
+                    positions[cell].append((r, c))
+
+        reachable = self._compute_reachable_from_agent(agent_state)
+
+        def nearest(targets: list[tuple[int, int]]) -> tuple[int, int] | None:
+            candidates = [p for p in targets if p in reachable]
+            if not candidates:
+                return None
+            return min(candidates, key=lambda p: reachable[p])
+
+        battery = nearest(positions[3])
+        if battery is not None:
+            return battery, self.goal_priority[3]
+
+        if not self._has_key:
+            key = nearest(positions[5])
+            if key is not None:
+                return key, self.goal_priority[5]
+
+        door = nearest(positions[4])
+        if door is not None:
+            return door, self.goal_priority[4]
+
+        # Fallback: preserve previous first-found behavior.
+        for r in range(self.rows):
+            for c in range(self.cols):
+                cell = self.grid[r][c]
+                if cell in self.goal_priority:
+                    return (r, c), self.goal_priority[cell]
+        return None, 0.0
+
+    def _compute_bfs_dist(self) -> dict[tuple[int, int], int]:
+        """
+        BFS from goal outward through the grid, respecting walls.
+        Returns {(row, col): steps_to_goal}.
+        """
+        from collections import deque
+
+        if not self.goal_pos:
+            return {}
+
+        dist: dict[tuple[int, int], int] = {}
+        gr, gc = self.goal_pos
+        q = deque([(gr, gc, 0)])
+        visited = {(gr, gc)}
+
+        while q:
+            r, c, d = q.popleft()
+            dist[(r, c)] = d
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if (
+                    0 <= nr < self.rows
+                    and 0 <= nc < self.cols
+                    and (nr, nc) not in visited
+                    and self._is_traversable_for_plan(nr, nc)
+                ):
+                    visited.add((nr, nc))
+                    q.append((nr, nc, d + 1))
+        return dist
+
     def _finalize_result(self, result: ExperimentResult) -> ExperimentResult:
         # Goal-aware bonus: reward moving closer, penalize moving away.
         distance_bonus = 0.0
         if self.goal_pos and result.outcome_type not in ("blocked", "danger"):
             nr = result.predicted_state.row
             nc = result.predicted_state.col
-            new_dist = abs(nr - self.goal_pos[0]) + abs(nc - self.goal_pos[1])
-            distance_bonus = (self.start_dist - new_dist) * 0.15 * self.goal_value
+            new_dist = self.bfs_dist.get((nr, nc), self.start_dist)
+            distance_bonus = (self.start_dist - new_dist) * 0.3
         result.distance_bonus = distance_bonus
         return result
 
@@ -199,6 +288,8 @@ class VirtualEnvironment:
         next_row, next_col = self._next_position(action)
         entity_id          = self._entity_at(next_row, next_col)
         abstraction        = self.store.get_active(entity_id)
+        if abstraction is None:
+            abstraction = self.store.get(entity_id)
 
         # ── unknown entity ────────────────────
         if abstraction is None:
@@ -214,7 +305,7 @@ class VirtualEnvironment:
                 involved_ids=[entity_id],
             ))
 
-        confidence    = abstraction.confidence
+        confidence    = max(MIN_CONFIDENCE, abstraction.confidence)
         involved_ids  = [entity_id]
         new_agent     = self.agent.clone()
 
